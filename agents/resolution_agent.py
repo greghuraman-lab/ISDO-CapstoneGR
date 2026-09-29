@@ -190,8 +190,10 @@ def resolve_ticket(ticket_number, short_description, description, category):
         "content": f"Find a resolution for this ticket:\n\nTicket: {ticket_number}\nCategory: {category}\nSummary: {short_description}\nDetails: {description}"
     }]
 
-    MAX_ROUNDS = 4  # hard safety cap: never loop forever if the model won't converge
+    resolution = None
+    MAX_ROUNDS = 4
     rounds = 0
+
     while True:
         rounds += 1
         if rounds > MAX_ROUNDS:
@@ -207,12 +209,6 @@ def resolve_ticket(ticket_number, short_description, description, category):
             messages=messages
         )
 
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if hasattr(block, "text"):
-                    print(block.text)
-            break
-
         if response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
             tool_results = []
@@ -227,6 +223,7 @@ def resolve_ticket(ticket_number, short_description, description, category):
                             print(f"     [{art['confidence_score']:.0%}] {art['article']}")
 
                     elif block.name == "draft_resolution":
+                        resolution = result  # capture immediately
                         conf = block.input.get("confidence")
                         auto = block.input.get("auto_resolve")
                         print(f"\n  → Confidence: {conf}  |  Auto-resolve: {auto}")
@@ -242,7 +239,34 @@ def resolve_ticket(ticket_number, short_description, description, category):
                         "content": json.dumps(result)
                     })
 
+            # Once draft_resolution has been called, the decision is final —
+            # don't spend another round soliciting closing commentary, and
+            # don't risk a later round (or a max_tokens stall) clobbering
+            # the result we already captured.
+            if resolution is not None:
+                break
+
             messages.append({"role": "user", "content": tool_results})
+            continue
+
+        # Any other stop_reason (end_turn, max_tokens, ...) with no tool
+        # call in it: nothing left to extract, stop instead of looping on
+        # an identical request forever.
+        for block in response.content:
+            if hasattr(block, "text"):
+                print(block.text)
+        break
+
+    if resolution is None:
+        resolution = {
+            "ticket_number": ticket_number,
+            "resolution_text": "",
+            "auto_resolve": False,
+            "confidence": "LOW",
+            "kb_article_used": "None"
+        }
+
+    return resolution
 
 # ── RUN ON SAMPLE TICKETS ─────────────────────────────────────────────────────
 

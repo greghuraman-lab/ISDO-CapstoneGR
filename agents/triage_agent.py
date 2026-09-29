@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 load_dotenv()
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5")   # override via .env if needed
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CSV_PATH = os.path.join(ROOT, "data", "incidents.csv")          # works from any working directory
+
 # ── TOOL DEFINITIONS ──────────────────────────────────────────────────────────
 
 tools = [
@@ -72,6 +76,7 @@ def get_open_tickets(csv_path):
     try:
         with open(csv_path, newline="") as f:
             for row in csv.DictReader(f):
+                row.pop(None, None)   # ignore overflow columns from malformed rows
                 if row.get("state") == "Open":
                     cat = row.get("category", "Unknown")
                     counts[cat] = counts.get(cat, 0) + 1
@@ -117,8 +122,16 @@ def triage_ticket(ticket_number, short_description, description):
         }
     ]
 
-    # Agentic loop
+    classification = None
+    MAX_ROUNDS = 4
+    rounds = 0
+
     while True:
+        rounds += 1
+        if rounds > MAX_ROUNDS:
+            print(f"  ⚠️  Stopped after {MAX_ROUNDS} rounds without a classification.")
+            break
+
         response = client.messages.create(
             model="claude-opus-5-5",
             max_tokens=500,
@@ -128,15 +141,7 @@ def triage_ticket(ticket_number, short_description, description):
             messages=messages
         )
 
-        if response.stop_reason == "end_turn":
-            # Extract text response if any
-            for block in response.content:
-                if hasattr(block, "text"):
-                    print(block.text)
-            break
-
         if response.stop_reason == "tool_use":
-            # Process tool calls
             messages.append({"role": "assistant", "content": response.content})
             tool_results = []
 
@@ -146,6 +151,7 @@ def triage_ticket(ticket_number, short_description, description):
                     result = handle_tool_call(block.name, block.input)
 
                     if block.name == "classify_ticket":
+                        classification = result
                         print(f"  → Category:    {result.get('category')}")
                         print(f"  → Priority:    {result.get('priority')}")
                         print(f"  → Assign To:   {result.get('assignment_group')}")
@@ -158,12 +164,23 @@ def triage_ticket(ticket_number, short_description, description):
                         "content": json.dumps(result)
                     })
 
+            if classification is not None:
+                break  # decision made — stop here
+
             messages.append({"role": "user", "content": tool_results})
+            continue
+
+        for block in response.content:
+            if hasattr(block, "text"):
+                print(block.text)
+        break
+
+    return classification
 
 # ── RUN ON SAMPLE TICKETS ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Test on 5 tickets from incidents.csv
+    # 5 lab tickets + 1 custom ticket (Step 5)
     test_tickets = [
         ("INC0001001", "VPN not connecting after password change",
          "User reports VPN client fails to connect after AD password was reset. Error: authentication failed."),
@@ -175,6 +192,12 @@ if __name__ == "__main__":
          "User locked out of AD account after 5 failed attempts. Needs immediate reset."),
         ("REQ-1002", "VPN access for new contractor joining project Phoenix",
          "New contractor [REDACTED NAME] emp-id ZEN-9823 joining next Monday. Email: contractor@client.com"),
+        # Step 5 - your own ticket
+        ("TEST-001", "Salesforce CRM access issue",
+         "User cannot access Salesforce CRM from company laptop since this morning."),
+        # Step 5 variant - uncomment to see priority change with multiple users
+        # ("TEST-002", "Salesforce CRM access issue",
+        #  "Entire Sales team (25 users) cannot access Salesforce CRM since this morning."),
     ]
 
     for number, short_desc, desc in test_tickets:
@@ -184,6 +207,6 @@ if __name__ == "__main__":
     print("OPEN TICKET COUNTS BY CATEGORY")
     print("="*55)
     # Also demo the get_open_tickets tool
-    counts = get_open_tickets("data/incidents.csv")
+    counts = get_open_tickets(CSV_PATH)
     for cat, count in sorted(counts.items()):
         print(f"  {cat:<20} {count} open")

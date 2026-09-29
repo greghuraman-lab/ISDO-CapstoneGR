@@ -70,7 +70,15 @@ tools = [
 
 # SLA thresholds by priority (minutes to resolve)
 SLA_MINUTES = {"P1": 60, "P2": 240, "P3": 480, "P4": 1440}
-
+ESCALATION_TEAMS = {
+    "Network": "L2-Network-Ops",
+    "Application": "L2-App-Support",
+    "Server": "L2-Server-Ops",
+    "Access": "L2-Security-Ops",
+    "Hardware": "L2-Desktop-Support",
+    "Email": "L2-Email-Support",
+    "Software": "L2-Desktop-Support",
+}
 def get_sla_status(ticket_number, sla_due, priority):
     """Calculate SLA status and breach risk."""
     try:
