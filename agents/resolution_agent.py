@@ -179,21 +179,32 @@ result is a valid, expected, correct outcome for tickets with no matching KB art
 as designed, not that you should search again. After ONE search, immediately call
 draft_resolution with whatever confidence level the result actually supports."""
 
-def resolve_ticket(ticket_number, short_description, description, category):
+def resolve_ticket(ticket_number, short_description, description, category, priority=None):
+    """Returns a dict with kb_article_used, resolution_text, confidence,
+    auto_resolve, top_score — orchestrator/supervisor.py (Lab C6+) reads all
+    five of these directly off the return value, so every exit path below
+    must produce them; falling off the end without a `return` (the old bug
+    here) silently gives the caller None and breaks resolution_node.
+
+    `priority` drives a guardrail on top of the model's own auto_resolve
+    call: even if the model says auto_resolve=True, we only honor that for
+    P3/P4 tickets — a P1/P2 issue always needs a human in the loop before
+    anything is sent automatically, regardless of KB confidence."""
     print(f"\n{'='*55}")
-    print(f"Resolving: {ticket_number} | Category: {category}")
+    print(f"Resolving: {ticket_number} | Category: {category} | Priority: {priority}")
     print(f"{'='*55}")
     print(f"Issue: {short_description}")
 
     messages = [{
         "role": "user",
-        "content": f"Find a resolution for this ticket:\n\nTicket: {ticket_number}\nCategory: {category}\nSummary: {short_description}\nDetails: {description}"
+        "content": f"Find a resolution for this ticket:\n\nTicket: {ticket_number}\nCategory: {category}\nPriority: {priority}\nSummary: {short_description}\nDetails: {description}"
     }]
 
-    resolution = None
-    MAX_ROUNDS = 4
-    rounds = 0
+    top_score = 0.0
+    draft = None
 
+    MAX_ROUNDS = 4  # hard safety cap: never loop forever if the model won't converge
+    rounds = 0
     while True:
         rounds += 1
         if rounds > MAX_ROUNDS:
@@ -201,7 +212,7 @@ def resolve_ticket(ticket_number, short_description, description, category):
             break
 
         response = client.messages.create(
-            model="claude-opus-5-5",
+            model="claude-opus-5",
             max_tokens=800,
             output_config={"effort": "low"},
             system=SYSTEM_PROMPT,
@@ -209,9 +220,16 @@ def resolve_ticket(ticket_number, short_description, description, category):
             messages=messages
         )
 
+        if response.stop_reason == "end_turn":
+            for block in response.content:
+                if hasattr(block, "text"):
+                    print(block.text)
+            break
+
         if response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
             tool_results = []
+            got_draft = False
 
             for block in response.content:
                 if block.type == "tool_use":
@@ -219,17 +237,21 @@ def resolve_ticket(ticket_number, short_description, description, category):
 
                     if block.name == "search_kb":
                         print(f"  → KB search: '{block.input.get('query')}'")
-                        for art in result.get("articles", []):
+                        articles = result.get("articles", [])
+                        if articles:
+                            top_score = articles[0]["confidence_score"]
+                        for art in articles:
                             print(f"     [{art['confidence_score']:.0%}] {art['article']}")
 
                     elif block.name == "draft_resolution":
-                        resolution = result  # capture immediately
-                        conf = block.input.get("confidence")
-                        auto = block.input.get("auto_resolve")
-                        print(f"\n  → Confidence: {conf}  |  Auto-resolve: {auto}")
-                        print(f"  → KB Article: {block.input.get('kb_article_used')}")
+                        draft = block.input
+                        got_draft = True
+                        conf = draft.get("confidence")
+                        auto = draft.get("auto_resolve")
+                        print(f"\n  → Confidence: {conf}  |  Auto-resolve (model): {auto}")
+                        print(f"  → KB Article: {draft.get('kb_article_used')}")
                         print(f"\n  RESOLUTION DRAFT:")
-                        print(f"  {block.input.get('resolution_text')[:500]}")
+                        print(f"  {draft.get('resolution_text', '')[:500]}")
                         if not auto:
                             print(f"\n  ⚠️  HITL FLAG: Low confidence — human review required before sending.")
 
@@ -239,34 +261,46 @@ def resolve_ticket(ticket_number, short_description, description, category):
                         "content": json.dumps(result)
                     })
 
-            # Once draft_resolution has been called, the decision is final —
-            # don't spend another round soliciting closing commentary, and
-            # don't risk a later round (or a max_tokens stall) clobbering
-            # the result we already captured.
-            if resolution is not None:
+            messages.append({"role": "user", "content": tool_results})
+
+            # The system prompt tells the model to call draft_resolution right
+            # after its one search, but don't rely on it also emitting a final
+            # end_turn text block after that — stop as soon as we have the
+            # draft so a chatty model doesn't burn another round for nothing.
+            if got_draft:
                 break
 
-            messages.append({"role": "user", "content": tool_results})
-            continue
-
-        # Any other stop_reason (end_turn, max_tokens, ...) with no tool
-        # call in it: nothing left to extract, stop instead of looping on
-        # an identical request forever.
-        for block in response.content:
-            if hasattr(block, "text"):
-                print(block.text)
-        break
-
-    if resolution is None:
-        resolution = {
-            "ticket_number": ticket_number,
-            "resolution_text": "",
-            "auto_resolve": False,
+    if draft is None:
+        # Model never called draft_resolution (hit MAX_ROUNDS, or stopped on
+        # end_turn without drafting) — fail safe to LOW confidence / no
+        # auto-resolve rather than returning None to the caller.
+        print("  ⚠️  No draft_resolution call — defaulting to LOW confidence, no auto-resolve.")
+        return {
+            "kb_article_used": "None",
+            "resolution_text": "No resolution could be drafted automatically. Needs manual review.",
             "confidence": "LOW",
-            "kb_article_used": "None"
+            "auto_resolve": False,
+            "top_score": top_score,
         }
 
-    return resolution
+    confidence = draft.get("confidence", "LOW")
+    model_auto_resolve = bool(draft.get("auto_resolve"))
+
+    # Priority guardrail: only P3/P4 tickets may auto-resolve, and only on
+    # HIGH confidence — matches the same rule used elsewhere in ISDO so a
+    # P1/P2 issue can't slip through on the model's say-so alone.
+    auto_resolve = model_auto_resolve and confidence == "HIGH" and priority in ("P3", "P4")
+    if model_auto_resolve and not auto_resolve:
+        print(f"  → Guardrail: model requested auto_resolve, but priority={priority} "
+              f"(confidence={confidence}) does not qualify — forcing auto_resolve=False.")
+
+    return {
+        "kb_article_used": draft.get("kb_article_used", "None"),
+        "resolution_text": draft.get("resolution_text", ""),
+        "confidence": confidence,
+        "auto_resolve": auto_resolve,
+        "top_score": top_score,
+    }
 
 # ── RUN ON SAMPLE TICKETS ─────────────────────────────────────────────────────
 
