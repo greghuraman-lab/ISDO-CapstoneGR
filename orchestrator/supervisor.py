@@ -1,14 +1,19 @@
 """
-ISDO Lab C6 - LangGraph Orchestrator
+ISDO Lab C6/C7 - LangGraph Orchestrator
 Wires the Triage, Resolution, SLA, HITL and Communication agents (Labs C3-C5)
 into a single StateGraph.
 
 Flow:
     triage -> resolution -> sla -> [hitl if hitl_required] -> communication
 
-hitl_required is set only for P1 tickets at CRITICAL/BREACHED SLA risk (same
-rule used standalone in Lab C5). Non-P1 CRITICAL/BREACHED tickets still get
-escalated, just without a human pause, matching Lab C5's escalation rule.
+Lab C7 extends the HITL gate to fire on THREE conditions (set in sla_node,
+after triage_priority and confidence are both known):
+    1. P1 ticket at CRITICAL/BREACHED SLA risk           (Lab C5/C6 rule)
+    2. Access grant request (category=Access, request_type=Access Grant)
+    3. LOW KB confidence, regardless of priority
+
+hitl_reason records WHICH condition(s) fired, and is shown in the approval
+prompt and folded into the audit log / communication message.
 
 Run from the project root:  python orchestrator/supervisor.py
 """
@@ -38,6 +43,7 @@ class TicketState(TypedDict, total=False):
     category: str
     priority: str
     sla_due: str
+    request_type: str          # NEW (C7) — e.g. 'Access Grant', for Jira-style REQ- tickets
     # Triage agent
     triage_category: str
     triage_priority: str
@@ -52,6 +58,7 @@ class TicketState(TypedDict, total=False):
     sla_breach_risk: str
     escalation_required: bool
     hitl_required: bool
+    hitl_reason: str           # NEW (C7) — why the HITL gate fired
     # HITL node
     hitl_approved: Optional[bool]
     escalation_team: Optional[str]
@@ -113,50 +120,92 @@ def resolution_node(state: TicketState) -> dict:
                           f"({result.get('top_score', 0):.0%})"),
     }
 
+
 def sla_node(state: TicketState) -> dict:
     print(f"\n▶ SLA AGENT — checking deadline")
 
     status = sla_agent.get_sla_status(state["ticket_number"], state["sla_due"], state["triage_priority"])
     breach_risk = status.get("breach_risk", "ON_TRACK")
     escalation_required = bool(status.get("requires_escalation"))
-    # HITL gate: only P1 tickets at CRITICAL/BREACHED pause for a human (Lab C5's rule).
-    hitl_required = escalation_required and state["triage_priority"] == "P1"
 
     print(f"  SLA Risk: {breach_risk}  |  Minutes remaining: {status.get('minutes_remaining')}")
+
+    # ── HITL trigger conditions (Lab C7) ────────────────────────────────────
+    # Three independent reasons a ticket needs a human before it can proceed.
+    # All three are checked — a ticket can (rarely) trigger more than one.
+    reasons = []
+
+    # 1) P1 ticket at CRITICAL/BREACHED SLA risk (Lab C5/C6 rule — unchanged)
+    if escalation_required and state["triage_priority"] == "P1":
+        reasons.append(f"P1 SLA {breach_risk} — escalation requires approval")
+
+    # 2) Access grant request — always security-sensitive, any priority
+    if state.get("triage_category") == "Access" and state.get("request_type") == "Access Grant":
+        reasons.append(f"ACCESS GRANT — {state.get('short_description', 'this request')} requires security approval")
+
+    # 3) LOW KB confidence — Resolution Agent found no clear fix, regardless of priority
+    if state.get("confidence") == "LOW":
+        reasons.append("LOW KB CONFIDENCE — Resolution Agent found no clear fix")
+
+    hitl_required = len(reasons) > 0
+    hitl_reason = "; ".join(reasons)
+
+    print(f"  HITL required: {hitl_required}" + (f"  |  Reason: {hitl_reason}" if hitl_required else ""))
 
     return {
         "sla_breach_risk": breach_risk,
         "escalation_required": escalation_required,
         "hitl_required": hitl_required,
-        "escalation_team": sla_agent.ESCALATION_TEAMS.get(state["triage_category"], "L2-Service-Desk"),
+        "hitl_reason": hitl_reason,
+        "escalation_team": sla_agent.ESCALATION_TEAMS.get(state.get("triage_category"), "L2-Service-Desk"),
         "audit_log": log("SLAAgent", "get_sla_status", f"{breach_risk} ({status.get('minutes_remaining')} min remaining)"),
     }
 
 
 def hitl_node(state: TicketState) -> dict:
-    approved = sla_agent.hitl_approve(state["ticket_number"], "Escalate ticket",
-                                       f"Escalate to {state['escalation_team']}")
-    if approved:
-        sla_agent.update_ticket(state["ticket_number"], "escalate", escalation_team=state["escalation_team"])
-        detail = f"Approved - escalated to {state['escalation_team']}"
-    else:
-        detail = "Rejected by human approver - escalation cancelled"
+    print(f"\n▶ HITL GATE — human approval required")
+    print(f"  {'⚠️  ' * 8}")
+    print(f"  Ticket:  {state['ticket_number']}  |  Priority: {state.get('triage_priority')}")
+    print(f"  Reason:  {state.get('hitl_reason', 'Escalation pending')}")
+    print(f"  {'⚠️  ' * 8}")
 
-    return {"hitl_approved": approved, "audit_log": log("HITLGate", "approve_escalation", detail)}
+    decision = input("  Approve action? [y/n]: ").strip().lower()
+    approved = decision == "y"
+
+    if approved:
+        sla_agent.update_ticket(state["ticket_number"], "escalate", escalation_team=state.get("escalation_team"))
+        detail = f"APPROVED — {state.get('hitl_reason', 'escalation')}"
+    else:
+        detail = f"REJECTED by human approver — {state.get('hitl_reason', 'escalation')} cancelled"
+
+    print(f"  Decision: {'✅ APPROVED' if approved else '❌ REJECTED'}")
+
+    return {"hitl_approved": approved, "audit_log": log("HITLGate", "approval_decision", detail)}
 
 
 def communication_node(state: TicketState) -> dict:
     print(f"\n▶ COMMUNICATION AGENT")
 
     ticket = state["ticket_number"]
+    reason = state.get("hitl_reason", "")
+    is_access_grant = "ACCESS GRANT" in reason
+
     if state.get("auto_resolve"):
         message = (f"Dear User, regarding {ticket}: we found a known fix for this issue "
                     f"({state.get('kb_article')}) and applied it automatically.\n\n{state.get('resolution_text')}")
         final_status = "RESOLVED"
+    elif state.get("hitl_approved") is True and is_access_grant:
+        message = (f"Dear Requester, your access grant request {ticket} has been approved "
+                    f"by {state.get('escalation_team')}. Access will be provisioned shortly.")
+        final_status = "APPROVED"
     elif state.get("hitl_approved") is True:
         message = (f"Dear User, regarding {ticket}: this ticket has been escalated to "
                     f"{state.get('escalation_team')} following approval. You will be contacted shortly.")
         final_status = "ESCALATED"
+    elif state.get("hitl_approved") is False and is_access_grant:
+        message = (f"Dear Requester, your access grant request {ticket} was reviewed and could not be "
+                    f"approved at this time. Please contact {state.get('escalation_team')} for details.")
+        final_status = "ACCESS GRANT REJECTED"
     elif state.get("hitl_approved") is False:
         message = (f"Dear User, regarding {ticket}: escalation was reviewed and held for manual handling "
                     f"by {state.get('triage_assignment_group')}.")
@@ -211,6 +260,17 @@ if __name__ == "__main__":
         {"ticket_number": "INC0001002", "short_description": "Cannot access ERP system - login error",
          "description": "Multiple Finance users unable to login to SAP. Error: DBCON_FAIL.",
          "category": "Application", "priority": "P1", "sla_due": "2024-01-15 10:40:00"},
+        # NEW (C7) — access grant request. Triggers HITL via the Access-Grant rule,
+        # independent of priority or SLA risk. request_type is required for the
+        # trigger to fire — the lab doc's own Step 4 box omits it, but the rule
+        # in the vibe-coding prompt explicitly checks for it.
+        {"ticket_number": "TEST-004", "short_description": "Cisco Webex not launching on MacBook M2 after Sonoma update",
+         "description": "Cisco Webex not launching on MacBook M2 after Sonoma update.",
+         "category": "Software", "priority": "P3", "sla_due": "2024-01-17 09:00:00"},
+        {"ticket_number": "REQ-1002", "short_description": "VPN access for new contractor",
+         "description": "Contractor needs VPN access. Email: contractor@client.com",
+         "category": "Access", "request_type": "Access Grant",
+         "priority": "P2", "sla_due": "2024-01-15 15:00:00"},
     ]
 
     all_results = []
